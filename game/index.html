@@ -3,271 +3,224 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kiln Yard — a three.js tactical FPS</title>
+<title>Ember Yard — hold the yard, wave by wave</title>
 <style>
-  /* One palette, six flat values, and the same six are the scene's colours in src/palette.js. */
+  /* Six flat colours, and src/config.js carries the same six for the 3D scene, so the page and the
+     yard never drift apart. Everything here is one job: lay out a first-person readout. */
   :root {
-    --canvas: #14161a;
-    --surface: #1e2228;
-    --hairline: #2c323a;
-    --ink: #e9e6df;
-    --muted: #98a0a8;
-    --accent: #e0632a;
-    --ct: #4f9ec4;
-    --t: #e0632a;
-    --radius: 4px;
-    --font-ui: system-ui, -apple-system, 'Segoe UI', sans-serif;
-    --font-readout: ui-monospace, 'SF Mono', Menlo, monospace;
+    --night: #12151a;
+    --panel: #1b2027;
+    --line: #2b323c;
+    --chalk: #eae6dc;
+    --dust: #949ca6;
+    --heat: #e0662b;
+    --safe: #58a3c6;
+    --radius: 3px;
+    --ui: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --mono: ui-monospace, 'SF Mono', Menlo, monospace;
   }
   * { box-sizing: border-box; }
   html, body {
     margin: 0; height: 100%; overflow: hidden;
-    background: var(--canvas); color: var(--ink); font-family: var(--font-ui);
-    -webkit-font-smoothing: antialiased;
+    background: var(--night); color: var(--chalk);
+    font-family: var(--ui); -webkit-font-smoothing: antialiased;
+    user-select: none;
   }
-  #game, #game canvas { position: fixed; inset: 0; display: block; }
-  #hud { position: fixed; inset: 0; pointer-events: none; font-family: var(--font-ui); }
+  #stage, #stage canvas { position: fixed; inset: 0; display: block; }
 
-  /* ---- crosshair: four ticks that open with movement and bloom with recoil ---- */
-  #crosshair { position: fixed; left: 50%; top: 50%; width: 60px; height: 60px; transform: translate(-50%, -50%); }
-  #crosshair i { position: absolute; background: var(--ink); box-shadow: 0 0 2px #0008; }
-  #crosshair .c-t { left: 29px; width: 2px; height: 9px; }
-  #crosshair .c-b { left: 29px; width: 2px; height: 9px; }
-  #crosshair .c-l { top: 29px; height: 2px; width: 9px; }
-  #crosshair .c-r { top: 29px; height: 2px; width: 9px; }
-  #crosshair.hit .c-t, #crosshair.hit .c-b, #crosshair.hit .c-l, #crosshair.hit .c-r { background: var(--accent); }
-  #crosshair.kill .c-t, #crosshair.kill .c-b, #crosshair.kill .c-l, #crosshair.kill .c-r { background: #ff5b45; }
-
-  /* ---- top bar: score, round clock, round number ---- */
-  #topbar {
-    position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
-    display: grid; grid-template-columns: auto auto auto; align-items: center; gap: 18px;
-    padding: 8px 14px; background: #14161ad9; border: 1px solid var(--hairline);
-    border-radius: var(--radius); backdrop-filter: blur(6px);
-  }
-  .team-score { font-family: var(--font-readout); font-size: 26px; font-weight: 600; letter-spacing: -0.02em; }
-  .team-score.ct { color: var(--ct); }
-  .team-score.t { color: var(--t); }
-  .team-tag { font-size: 10px; letter-spacing: 0.14em; color: var(--muted); text-align: center; }
-  #clock { font-family: var(--font-readout); font-size: 22px; min-width: 62px; text-align: center; }
-  #clock.low { color: var(--accent); }
-
-  /* ---- objective + bomb status, top left ---- */
-  #objective {
-    position: fixed; top: 18px; left: 18px; max-width: 300px;
-    padding: 10px 12px; background: #14161ad9; border: 1px solid var(--hairline);
-    border-left: 2px solid var(--ct); border-radius: var(--radius);
-  }
-  #objective h2 { margin: 0 0 4px; font-size: 11px; letter-spacing: 0.14em; color: var(--muted); font-weight: 600; }
-  #objective p { margin: 0; font-size: 14px; line-height: 1.35; }
-  #objective.planted { border-left-color: var(--accent); }
-  #objective.planted p { color: var(--accent); }
-
-  /* ---- kill feed, top right ---- */
-  #feed { position: fixed; top: 18px; right: 18px; display: grid; gap: 4px; justify-items: end; }
-  #feed div {
-    font-family: var(--font-readout); font-size: 12px; padding: 4px 8px;
-    background: #14161ac9; border: 1px solid var(--hairline); border-radius: var(--radius);
-    animation: feedIn 160ms ease-out;
-  }
-  #feed b { color: var(--accent); font-weight: 600; }
-  @keyframes feedIn { from { opacity: 0; transform: translateX(8px); } }
+  /* The readout layer never eats a click: pointer lock lives on the canvas underneath. */
+  #readout { position: fixed; inset: 0; pointer-events: none; }
 
   /* ---- vitals, bottom left ---- */
   #vitals {
-    position: fixed; left: 18px; bottom: 18px; display: grid; gap: 6px; width: 210px;
-    padding: 10px 12px; background: #14161ad9; border: 1px solid var(--hairline);
-    border-radius: var(--radius); backdrop-filter: blur(6px);
+    position: absolute; left: 26px; bottom: 24px;
+    display: flex; align-items: flex-end; gap: 22px;
   }
-  .bar { height: 7px; background: #ffffff1f; border: 1px solid var(--hairline); border-radius: 2px; overflow: hidden; }
-  .bar span { display: block; height: 100%; width: 100%; transition: width 90ms linear; }
-  #health-bar span { background: var(--ink); }
-  #health-bar.hurt span { background: var(--accent); }
-  #armor-bar span { background: var(--ct); }
-  .vital-row { display: flex; align-items: baseline; gap: 8px; font-family: var(--font-readout); }
-  .vital-row b { font-size: 30px; font-weight: 600; letter-spacing: -0.03em; }
-  .vital-row i { font-size: 11px; font-style: normal; color: var(--muted); letter-spacing: 0.1em; }
+  .gauge { display: flex; flex-direction: column; gap: 5px; }
+  .gauge .caption {
+    font-size: 10px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--dust);
+  }
+  .gauge .value {
+    font-family: var(--mono); font-size: 30px; line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .gauge.hurt .value { color: var(--heat); }
+  .bar { width: 132px; height: 5px; background: #262c34; border-radius: 2px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 100%; background: var(--chalk); transition: width 120ms linear; }
+  .bar.health > i { background: var(--safe); }
+  .bar.health.low > i { background: var(--heat); }
 
-  /* ---- money + weapon, bottom right ---- */
-  #wallet {
-    position: fixed; right: 18px; bottom: 18px; text-align: right;
-    font-family: var(--font-readout);
+  /* ---- ammunition, bottom right ---- */
+  #ammo {
+    position: absolute; right: 26px; bottom: 22px; text-align: right;
+    display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
   }
-  #money { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; color: #8fd694; }
-  #money.flash { color: var(--ink); }
-  #weapon-name { font-size: 12px; letter-spacing: 0.1em; color: var(--muted); margin-top: 2px; }
-  #ammo { display: flex; align-items: baseline; justify-content: flex-end; gap: 6px; margin-top: 2px; }
-  #ammo-mag { font-size: 44px; line-height: 1; letter-spacing: -0.04em; }
-  #ammo.empty #ammo-mag { color: var(--accent); }
-  #ammo-reserve { font-size: 14px; color: var(--muted); }
-  #grenades { font-size: 12px; color: var(--ink); letter-spacing: 0.08em; margin-top: 4px; }
+  #ammo .gun { font-size: 11px; letter-spacing: .18em; text-transform: uppercase; color: var(--dust); }
+  #ammo .count { font-family: var(--mono); font-size: 42px; line-height: 1; font-variant-numeric: tabular-nums; }
+  #ammo .count small { font-size: 17px; color: var(--dust); }
+  #ammo.reloading .count { color: var(--heat); }
 
-  /* ---- defuse / plant progress ---- */
-  #progress {
-    position: fixed; left: 50%; bottom: 22%; transform: translateX(-50%);
-    width: 240px; text-align: center; display: none;
-  }
-  #progress.on { display: block; }
-  #progress p { margin: 0 0 6px; font-size: 12px; letter-spacing: 0.12em; color: var(--ink); }
-  #progress .bar { height: 8px; }
-  #progress .bar span { background: var(--accent); width: 0%; transition: none; }
+  /* ---- the wave, top left ---- */
+  #campaign { position: absolute; left: 26px; top: 22px; display: flex; flex-direction: column; gap: 3px; }
+  #campaign .wave { font-family: var(--mono); font-size: 20px; letter-spacing: .04em; }
+  #campaign .left { font-size: 11px; letter-spacing: .15em; text-transform: uppercase; color: var(--dust); }
 
-  /* ---- buy menu ---- */
-  #buy {
-    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
-    width: min(560px, 92vw); padding: 20px;
-    background: #14161af2; border: 1px solid var(--hairline); border-radius: 6px;
-    pointer-events: auto; box-shadow: 0 24px 60px #00000080;
-  }
-  #buy[hidden] { display: none; }
-  #buy header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 14px; }
-  #buy h2 { margin: 0; font-size: 15px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 600; }
-  #buy header span { font-family: var(--font-readout); font-size: 20px; color: #8fd694; }
-  #buy ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
-  #buy li {
-    display: grid; grid-template-columns: 22px 1fr 54px 62px; align-items: center; gap: 10px;
-    padding: 10px 12px; border: 1px solid var(--hairline); border-radius: var(--radius);
-    background: #1e222899; cursor: pointer; transition: border-color 90ms, background-color 90ms;
-  }
-  #buy li:hover { border-color: var(--accent); background: #1e2228; }
-  #buy li.cant { opacity: 0.42; cursor: not-allowed; }
-  #buy li.owned { border-color: var(--ct); }
-  #buy kbd {
-    font-family: var(--font-readout); font-size: 11px; text-align: center; padding: 2px 0;
-    border: 1px solid var(--hairline); border-radius: 2px; color: var(--muted);
-  }
-  #buy .item-name { font-size: 14px; }
-  #buy .item-note { font-size: 11px; color: var(--muted); }
-  #buy .item-note:not(:empty) { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  #buy .price { font-family: var(--font-readout); font-size: 14px; color: #8fd694; text-align: right; }
-  #buy .owned-tag { font-size: 10px; letter-spacing: 0.1em; color: var(--ct); text-align: right; }
-  #buy footer { margin-top: 14px; font-size: 12px; color: var(--muted); }
+  /* ---- score, top right ---- */
+  #tally { position: absolute; right: 26px; top: 22px; text-align: right; display: flex; flex-direction: column; gap: 3px; }
+  #tally .score { font-family: var(--mono); font-size: 20px; font-variant-numeric: tabular-nums; }
+  #tally .caption { font-size: 11px; letter-spacing: .15em; text-transform: uppercase; color: var(--dust); }
 
-  /* ---- round banner ---- */
-  /* Sits high and never over the crosshair: in a shooter the centre of the frame belongs to the
-     sightline, so the banner lives above it and the shadow keeps it readable on any wall. */
-  #banner {
-    position: fixed; left: 0; right: 0; top: 15%; text-align: center; pointer-events: none;
-    opacity: 0; transition: opacity 200ms ease;
-    text-shadow: 0 2px 18px #0b0d10e6, 0 1px 3px #0b0d10cc;
+  /* ---- sight ---- */
+  #sight {
+    position: absolute; left: 50%; top: 50%; width: 22px; height: 22px;
+    margin: -11px 0 0 -11px;
   }
-  #banner.on { opacity: 1; }
-  #banner h1 { margin: 0; font-size: 40px; letter-spacing: 0.02em; font-weight: 600; text-wrap: balance; }
-  #banner p { margin: 8px 0 0; font-size: 14px; color: var(--ink); opacity: 0.85; letter-spacing: 0.06em; }
-  #banner.win h1 { color: var(--ct); }
-  #banner.lose h1 { color: var(--accent); }
+  #sight::before, #sight::after {
+    content: ''; position: absolute; background: var(--chalk); opacity: .82;
+  }
+  #sight::before { left: 50%; top: 0; width: 1px; height: 100%; margin-left: -.5px; }
+  #sight::after { top: 50%; left: 0; height: 1px; width: 100%; margin-top: -.5px; }
+  #sight.hit::before, #sight.hit::after { background: var(--heat); opacity: 1; }
 
-  /* ---- damage vignette ---- */
-  #damage {
-    position: fixed; inset: 0; pointer-events: none; opacity: 0;
-    background: radial-gradient(ellipse at center, #ff3a1a00 42%, #c02f10b3 100%);
-    transition: opacity 220ms ease-out;
+  /* ---- the kill line: newest on top, fading out ---- */
+  #dispatch { position: absolute; right: 26px; top: 74px; width: 260px; display: flex; flex-direction: column; gap: 3px; }
+  #dispatch .row {
+    font-size: 12px; text-align: right; color: var(--chalk);
+    background: rgba(18, 21, 26, .72); border-right: 2px solid var(--line);
+    padding: 3px 7px; animation: slide 200ms ease-out;
   }
+  #dispatch .row em { font-style: normal; color: var(--heat); }
+  #dispatch .row span { color: var(--dust); }
+  @keyframes slide { from { opacity: 0; transform: translateX(10px); } to { opacity: 1; transform: none; } }
 
-  /* ---- start overlay ---- */
-  .overlay {
-    position: fixed; inset: 0; display: grid; place-items: center; padding: 24px;
-    background: radial-gradient(ellipse at 50% 45%, #14161a4d 18%, #14161ac9 78%);
+  /* ---- the call-out, high on the frame so it never sits over the sight ---- */
+  #callout {
+    position: absolute; left: 0; right: 0; top: 19%; text-align: center;
+    opacity: 0; transition: opacity 180ms ease;
   }
-  .overlay[hidden] { display: none; }
-  .panel {
-    width: min(520px, 100%); padding: 32px;
-    background: #1e2228f2; border: 1px solid var(--hairline); border-radius: 6px;
-    box-shadow: 0 30px 80px #00000099;
+  #callout.on { opacity: 1; }
+  #callout .headline {
+    font-size: 40px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+    text-shadow: 0 2px 24px rgba(0, 0, 0, .9);
   }
-  .panel .eyebrow { font-size: 11px; letter-spacing: 0.22em; color: var(--accent); margin: 0 0 10px; }
-  .panel h1 { margin: 0 0 10px; font-size: 38px; line-height: 1.1; font-weight: 600; letter-spacing: -0.02em; text-wrap: balance; }
-  .panel p { margin: 0 0 22px; max-width: 46ch; font-size: 15px; line-height: 1.55; color: var(--muted); }
-  #play {
-    font: inherit; font-weight: 600; padding: 12px 18px; white-space: nowrap;
-    border: 1px solid var(--accent); border-radius: 8px; background: var(--accent);
-    color: #14161a; cursor: pointer; transition: background-color 120ms;
+  #callout .sub { margin-top: 5px; font-size: 13px; letter-spacing: .12em; color: var(--dust); text-transform: uppercase; }
+
+  /* ---- full-screen sheets: title and the after-action report ---- */
+  .sheet {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(12, 14, 18, .86); backdrop-filter: blur(2px);
+    pointer-events: auto;
   }
-  #play:hover { background: var(--ink); border-color: var(--ink); }
-  .keys { margin: 22px 0 0; padding: 0; list-style: none; display: grid; gap: 7px; font-size: 13px; color: var(--muted); }
-  .keys li { display: flex; align-items: center; gap: 8px; }
-  .keys kbd {
-    min-width: 24px; padding: 2px 6px; border: 1px solid var(--hairline); border-radius: 3px;
-    font-family: var(--font-readout); font-size: 11px; color: var(--ink); text-align: center;
+  .sheet[hidden] { display: none; }
+  .card {
+    width: min(560px, calc(100vw - 48px));
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 34px 36px 30px;
   }
-  @media (prefers-reduced-motion: reduce) { * { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; } }
+  .card .eyebrow { font-size: 10px; letter-spacing: .24em; text-transform: uppercase; color: var(--heat); }
+  .card h1 { margin: 9px 0 6px; font-size: 38px; letter-spacing: -.01em; line-height: 1; }
+  .card p.tag { margin: 0 0 22px; color: var(--dust); font-size: 14px; line-height: 1.5; }
+  .keys { display: grid; grid-template-columns: 96px 1fr; gap: 7px 14px; font-size: 13px; margin-bottom: 26px; }
+  .keys b {
+    font-family: var(--mono); font-weight: 500; font-size: 11px; letter-spacing: .04em;
+    background: #232a33; border: 1px solid var(--line); border-radius: 3px;
+    padding: 3px 0; text-align: center; color: var(--chalk);
+  }
+  .keys span { color: var(--dust); align-self: center; }
+  .go {
+    display: inline-block; background: var(--heat); color: #14171c; font-weight: 700;
+    font-size: 13px; letter-spacing: .12em; text-transform: uppercase;
+    padding: 12px 26px; border-radius: var(--radius); border: 0; cursor: pointer;
+    font-family: var(--ui);
+  }
+  .go:hover { filter: brightness(1.09); }
+
+  /* the after-action report: the numbers of the run, in the order a player asks for them */
+  .report { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px 20px; margin: 4px 0 26px; }
+  .report div { border-top: 1px solid var(--line); padding-top: 9px; }
+  .report dt { font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--dust); }
+  .report dd { margin: 4px 0 0; font-family: var(--mono); font-size: 24px; font-variant-numeric: tabular-nums; }
+  .report dd.best { color: var(--heat); }
 </style>
 </head>
 <body>
-<div id="game"></div>
+<div id="stage"></div>
 
-<div id="hud" aria-hidden="true">
-  <div id="crosshair"><i class="c-t"></i><i class="c-b"></i><i class="c-l"></i><i class="c-r"></i></div>
-
-  <div id="topbar">
-    <div class="team-score ct" id="score-ct">0</div>
-    <div>
-      <div class="team-tag">ROUND <span id="round-no">1</span></div>
-      <div id="clock">1:45</div>
-    </div>
-    <div class="team-score t" id="score-t">0</div>
+<div id="readout">
+  <div id="campaign">
+    <div class="wave">WAVE 1</div>
+    <div class="left">0 of 6 left</div>
   </div>
 
-  <div id="objective">
-    <h2>OBJECTIVE</h2>
-    <p id="objective-text">Defend the kiln yard. Hold both sites.</p>
+  <div id="tally">
+    <div class="score">0</div>
+    <div class="caption">score</div>
   </div>
 
-  <div id="feed"></div>
+  <div id="dispatch"></div>
+
+  <div id="callout"><div class="headline"></div><div class="sub"></div></div>
+
+  <div id="sight"></div>
 
   <div id="vitals">
-    <div class="vital-row"><b id="health">100</b><i>HEALTH</i></div>
-    <div class="bar" id="health-bar"><span></span></div>
-    <div class="vital-row" style="margin-top:2px"><b id="armor" style="font-size:18px">0</b><i>ARMOR</i></div>
-    <div class="bar" id="armor-bar"><span style="width:0%"></span></div>
+    <div class="gauge" id="health-gauge">
+      <div class="caption">vitals</div>
+      <div class="value" id="health-value">100</div>
+      <div class="bar health" id="health-bar"><i></i></div>
+    </div>
+    <div class="gauge">
+      <div class="caption">armour</div>
+      <div class="value" id="armour-value">50</div>
+    </div>
   </div>
 
-  <div id="wallet">
-    <div id="money">$800</div>
-    <div id="weapon-name">PISTOL</div>
-    <div id="ammo"><span id="ammo-mag">12</span><span id="ammo-reserve">/ 48</span></div>
-    <div id="grenades">FRAG 0 · <span style="color:var(--muted)">G to throw</span></div>
+  <div id="ammo">
+    <div class="gun" id="gun-name">carbine</div>
+    <div class="count"><span id="ammo-now">30</span><small> / <span id="ammo-max">30</span></small></div>
   </div>
-
-  <div id="progress">
-    <p id="progress-label">DEFUSING</p>
-    <div class="bar"><span id="progress-fill"></span></div>
-  </div>
-
-  <div id="buy" hidden>
-    <header>
-      <h2>Buy phase</h2>
-      <span id="buy-money">$800</span>
-    </header>
-    <ul id="buy-list"></ul>
-    <footer>Press <b>1</b>–<b>6</b> to buy, <b>B</b> to close. Rounds pay $325 a kill, $3000 for a win.</footer>
-  </div>
-
-  <div id="banner"><h1 id="banner-title"></h1><p id="banner-sub"></p></div>
-  <div id="damage"></div>
 </div>
 
-<div id="overlay" class="overlay">
-  <section class="panel" role="dialog" aria-modal="true" aria-labelledby="overlay-title">
-    <p class="eyebrow">TACTICAL · ROUND-BASED · ONE DEFENDER</p>
-    <h1 id="overlay-title">Kiln Yard</h1>
-    <p id="overlay-copy">A brick kiln yard at dusk. Attackers come for the kiln floor with a charge; you hold it alone. Buy between rounds, spend on accuracy, and make every burst count.</p>
-    <button id="play" type="button">Deploy</button>
-    <ul class="keys">
-      <li><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> Move · <kbd>Ctrl</kbd> Crouch</li>
-      <li><kbd>Mouse</kbd> Look · <kbd>Click</kbd> Fire · <kbd>R</kbd> Reload</li>
-      <li><kbd>B</kbd> Buy menu · <kbd>G</kbd> Frag · <kbd>E</kbd> Defuse</li>
-      <li><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> Switch weapon · <kbd>Space</kbd> Jump</li>
-    </ul>
-  </section>
-</div>
+<!-- The title sheet: the pitch, the controls, and the one button that starts a run. -->
+<section class="sheet" id="title-sheet">
+  <div class="card">
+    <div class="eyebrow">wave defence</div>
+    <h1>Ember Yard</h1>
+    <p class="tag">
+      A foundry yard, four ways in, and a charge you have to keep off the kiln floor.
+      Waves come at you from the gates. Hold the yard, take the head shots, stay alive.
+    </p>
+    <div class="keys">
+      <b>W A S D</b><span>move</span>
+      <b>Mouse</b><span>look</span>
+      <b>Left click</b><span>fire</span>
+      <b>R</b><span>reload</span>
+      <b>Space</b><span>sprint</span>
+      <b>Esc</b><span>release the mouse</span>
+    </div>
+    <button class="go" id="begin">Hold the yard</button>
+  </div>
+</section>
+
+<!-- The after-action report: the loop's last beat, with the restart that closes it. -->
+<section class="sheet" id="report-sheet" hidden>
+  <div class="card">
+    <div class="eyebrow" id="report-eyebrow">after action</div>
+    <h1 id="report-title">The yard fell</h1>
+    <p class="tag" id="report-line">They walked through the gates you were holding.</p>
+    <dl class="report">
+      <div><dt>waves held</dt><dd id="report-waves">0</dd></div>
+      <div><dt>score</dt><dd class="best" id="report-score">0</dd></div>
+      <div><dt>kills</dt><dd id="report-kills">0</dd></div>
+      <div><dt>best head shots</dt><dd id="report-heads">0</dd></div>
+    </dl>
+    <button class="go" id="again">Take the yard again</button>
+  </div>
+</section>
 
 <script type="importmap">
-{
-  "imports": {
-    "three": "./vendor/three/three.module.min.js"
-  }
-}
+  { "imports": { "three": "./vendor/three/three.module.min.js" } }
 </script>
 <script type="module" src="./src/main.js"></script>
 </body>

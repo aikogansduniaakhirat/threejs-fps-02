@@ -1,710 +1,534 @@
-// Boot, the one loop, and the wiring between the modules: a fixed 60 Hz simulation feeding a
-// render at the display's rate, rounds scored by the match, and every subsystem keeping to its
-// own file. ?shot=start|play|end|buy with &seed=N sets up a deterministic frame for a capture,
-// renders twice, then freezes it and sets window.__shotReady.
+// Ember Yard — the wiring. One fixed step drives the body, the carbine, the attackers and the wave
+// director; the render pass reads their state and never writes it. ?shot=start|play|end with
+// &seed=N builds a deterministic frame for a capture, renders twice, then freezes and raises
+// window.__shotReady, which is how the screenshots in screenshots/ are taken.
+
 import * as THREE from 'three';
-import { PALETTE } from './palette.js';
-import { createWorld, SPAWNS, SITE, inSite } from './world.js';
+import { PALETTE, BODY, WEAPONS, YARD } from './config.js';
+import { createYard } from './yard.js';
+import { createBody } from './body.js';
+import { createCarbine } from './carbine.js';
 import { createInput } from './input.js';
-import { createPlayer } from './player.js';
-import { createArsenal, GRENADE, WEAPONS } from './arsenal.js';
-import { createBots } from './bots.js';
-import { createHud } from './hud.js';
-import { createMatch, BUY_LIST } from './match.js';
+import { createAttackerKit, pickHolding } from './attacker.js';
+import { createReadout } from './readout.js';
+import { createWaves } from './waves.js';
 
 const FIXED_STEP = 1 / 60;
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
 const seed = Number.parseInt(params.get('seed') ?? '1', 10) || 1;
 
+// A tiny seeded generator, so a capture frame is the same twice.
 function mulberry32(initial) {
-  let a = initial;
+  let a = initial >>> 0;
   return function random() {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 const random = mulberry32(seed);
 
-// ---- renderer, scene, camera ----------------------------------------------------------------
+// ---- the stage ----
+const host = document.querySelector('#stage');
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.28;
-document.getElementById('game').appendChild(renderer.domElement);
+renderer.toneMappingExposure = 1.06;
+host.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(PALETTE.sky);
-scene.fog = new THREE.Fog(new THREE.Color(PALETTE.sky), 34, 96);
-const camera = new THREE.PerspectiveCamera(78, window.innerWidth / window.innerHeight, 0.04, 220);
-camera.rotation.order = 'YXZ';
+scene.background = new THREE.Color(PALETTE.fog);
+scene.fog = new THREE.Fog(PALETTE.fog, 30, 96);
+
+const camera = new THREE.PerspectiveCamera(76, window.innerWidth / window.innerHeight, 0.05, 220);
 scene.add(camera);
 
-// The sky dome: a single inverted sphere with a vertical gradient, so the dusk reads above the
-// walls and the fog never meets a flat colour.
-const skyGeometry = new THREE.SphereGeometry(150, 24, 16);
-const skyColors = new Float32Array(skyGeometry.attributes.position.count * 3);
-const top = new THREE.Color(PALETTE.sky).lerp(new THREE.Color('#0e1116'), 0.55);
-const bottom = new THREE.Color(PALETTE.ember).lerp(new THREE.Color(PALETTE.ground), 0.72);
-const positionAttribute = skyGeometry.attributes.position;
-const tempColor = new THREE.Color();
-for (let i = 0; i < positionAttribute.count; i += 1) {
-  const y = positionAttribute.getY(i) / 150;
-  tempColor.copy(bottom).lerp(top, Math.max(0, Math.min(1, y * 0.5 + 0.5)));
-  skyColors[i * 3] = tempColor.r;
-  skyColors[i * 3 + 1] = tempColor.g;
-  skyColors[i * 3 + 2] = tempColor.b;
-}
-skyGeometry.setAttribute('color', new THREE.BufferAttribute(skyColors, 3));
-const skyDome = new THREE.Mesh(skyGeometry, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false }));
-scene.add(skyDome);
+// ---- light: one key from above the kiln, one cool fill from the gates, and a warm bounce ----
+// The yard is a night scene, but a readable one: the key carries the geometry, the fill separates
+// one wall from the next, and the hemisphere keeps the shadowed faces above black so a silhouette
+// still reads at the far end.
+const key = new THREE.DirectionalLight('#ffd9b8', 2.6);
+key.position.set(-14, 26, -18);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+key.shadow.camera.left = -34;
+key.shadow.camera.right = 34;
+key.shadow.camera.top = 34;
+key.shadow.camera.bottom = -34;
+key.shadow.camera.near = 1;
+key.shadow.camera.far = 78;
+key.shadow.bias = -0.0006;
+scene.add(key);
 
-const world = createWorld(scene);
-world.spawns = SPAWNS.t;
+const fill = new THREE.DirectionalLight('#8ec2e8', 1.15);
+fill.position.set(16, 14, 22);
+scene.add(fill);
 
-const player = createPlayer(world.colliders, SPAWNS.ct);
-player.health = 100;
-const arsenal = createArsenal(camera);
-player.arsenal = arsenal;
-const bots = createBots(scene, world);
-const hud = createHud();
-const match = createMatch(player);
-const input = createInput(renderer.domElement, onLockChange);
+const rim = new THREE.DirectionalLight('#ffb27a', 0.8);
+rim.position.set(6, 10, -26);
+scene.add(rim);
+
+const bounce = new THREE.HemisphereLight('#5d7285', '#3a2b22', 1.05);
+scene.add(bounce);
+
+// ---- the pieces ----
+const yard = createYard(scene);
+const body = createBody(yard.colliders, yard.spawns.player);
+const carbine = createCarbine(camera);
+const attackers = createAttackerKit(scene, yard);
+const readout = createReadout();
+const waves = createWaves();
+const input = createInput(renderer.domElement, () => {});
+
+// The player's own numbers, kept here rather than on the body: the body is movement only.
+const player = {
+  health: 100,
+  maxHealth: 100,
+  armour: 50,
+  alive: true,
+  hurtFlash: 0,
+};
 
 const raycaster = new THREE.Raycaster();
-raycaster.far = 120;
-const shootMeshes = world.shootables.concat(bots.hitMeshes);
-const direction = new THREE.Vector3();
-const muzzle = new THREE.Vector3();
-const body = player.state;
+const shootables = yard.shootables.concat(attackers.hitMeshes);
+const forward = new THREE.Vector3();
+const muzzlePoint = new THREE.Vector3();
+const eyePoint = new THREE.Vector3();
 
-// The bomb: a small box that appears on the ground when the charge is planted.
-const bombMesh = new THREE.Mesh(
-  new THREE.BoxGeometry(0.34, 0.2, 0.26),
-  new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.brickDark), roughness: 0.6, metalness: 0.3, emissive: new THREE.Color(PALETTE.ember), emissiveIntensity: 0.35 }),
-);
-bombMesh.visible = false;
-scene.add(bombMesh);
+// Tracers: a pool of thin lines, reused, so a long burst does not allocate.
+const TRACER_COUNT = 24;
+const tracerGeometry = new THREE.BufferGeometry();
+tracerGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(TRACER_COUNT * 6), 3));
+const tracerMaterial = new THREE.LineBasicMaterial({ color: '#ffcf9a', transparent: true, opacity: 0.85 });
+const tracers = new THREE.LineSegments(tracerGeometry, tracerMaterial);
+tracers.frustumCulled = false;
+scene.add(tracers);
+const tracerLife = new Float32Array(TRACER_COUNT);
+let tracerCursor = 0;
 
-// The grenade's blast: a ring that expands and fades.
-const blastMesh = new THREE.Mesh(
-  new THREE.RingGeometry(0.4, 0.9, 26),
-  new THREE.MeshBasicMaterial({ color: new THREE.Color(PALETTE.glow), transparent: true, opacity: 0.9, side: THREE.DoubleSide, depthWrite: false }),
-);
-blastMesh.rotation.x = -Math.PI / 2;
-blastMesh.visible = false;
-scene.add(blastMesh);
-let blastTimer = 0;
-const blastAt = new THREE.Vector3();
+// Impact sparks: a small pool of points that fade where a round lands.
+const SPARK_COUNT = 40;
+const sparkGeometry = new THREE.BufferGeometry();
+sparkGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(SPARK_COUNT * 3), 3));
+const sparkMaterial = new THREE.PointsMaterial({ color: '#ffb066', size: 0.055, transparent: true, opacity: 0.9 });
+const sparks = new THREE.Points(sparkGeometry, sparkMaterial);
+sparks.frustumCulled = false;
+scene.add(sparks);
 
-// Live grenades in the air: one projectile table, cleared each round.
-const grenadeMesh = new THREE.Mesh(
-  new THREE.IcosahedronGeometry(0.11, 1),
-  new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.metal), roughness: 0.5, metalness: 0.6 }),
-);
-grenadeMesh.visible = false;
-scene.add(grenadeMesh);
-const liveGrenade = { active: false, position: new THREE.Vector3(), velocity: new THREE.Vector3(), fuse: 0 };
-
-let score = 0;
-let frozen = false;
-let suppressBotFire = false;
+// ---- run state ----
+const clock = { last: performance.now(), accumulator: 0 };
+let running = false;
 let started = false;
-let accumulator = 0;
-let lastTime = performance.now();
-let firingHeld = false;
+let paused = false;
 
-hud.onPlay(() => {
-  if (shot) return;
-  if (match.state.phase === 'matchover') restartMatch();
-  input.requestLock();
-});
-hud.onBuy((id) => {
-  const result = match.buy(id);
-  if (result.ok) {
-    refreshBuy();
-    hud.pushFeed(`<b>bought</b> ${id.toUpperCase()}`);
+function pushTracer(from, to) {
+  const attr = tracerGeometry.getAttribute('position');
+  const base = tracerCursor * 6;
+  attr.array[base + 0] = from.x;
+  attr.array[base + 1] = from.y;
+  attr.array[base + 2] = from.z;
+  attr.array[base + 3] = to.x;
+  attr.array[base + 4] = to.y;
+  attr.array[base + 5] = to.z;
+  attr.needsUpdate = true;
+  tracerLife[tracerCursor] = 0.055;
+  tracerCursor = (tracerCursor + 1) % TRACER_COUNT;
+}
+
+function sparkAt(point) {
+  const attr = sparkGeometry.getAttribute('position');
+  // Reuse the oldest slot: the array doubles as a ring, which is fine for a 0.12 s effect.
+  for (let i = SPARK_COUNT - 1; i > 0; i -= 1) {
+    attr.array[i * 3 + 0] = attr.array[(i - 1) * 3 + 0];
+    attr.array[i * 3 + 1] = attr.array[(i - 1) * 3 + 1];
+    attr.array[i * 3 + 2] = attr.array[(i - 1) * 3 + 2];
   }
-});
-
-upholdObjective();
-hud.setScore(0, 0, 1);
-hud.setWallet(match.state.money);
-refreshWallet();
-
-function refreshWallet() {
-  hud.setWeapon(arsenal.spec().name, arsenal.state.mag, arsenal.state.reserve, arsenal.state.grenades, true);
-  hud.setVitals(player.health, match.state.armor);
-  hud.setWallet(match.state.money);
+  attr.array[0] = point.x;
+  attr.array[1] = point.y;
+  attr.array[2] = point.z;
+  attr.needsUpdate = true;
 }
 
-function refreshBuy() {
-  hud.showBuy(match.state.money, arsenal.state.owned, match.state.armor >= 100, match.state.hasDefuseKit, arsenal.state.grenades);
-}
-
-function upholdObjective() {
-  if (match.state.bomb.planted) {
-    hud.setObjective('CHARGE PLANTED — hold E on the kiln floor to defuse.', true);
-  } else if (match.state.phase === 'live') {
-    hud.setObjective('Stop the attackers reaching the kiln floor. Headshots end fights.', false);
-  } else {
-    hud.setObjective('Buy phase. Spend before the doors open.', false);
-  }
-}
-
-function onLockChange(locked) {
-  if (shot) return;
-  if (locked) {
-    started = true;
-    hud.hideOverlay();
-  } else if (match.state.phase !== 'matchover') {
-    hud.showOverlay(started ? 'paused' : 'start');
-  }
-}
-
-function restartMatch() {
-  match.reset();
-  arsenal.refill();
-  player.health = 100;
-  player.reset(SPAWNS.ct);
-  bots.reset();
-  bots.spawnForRound(1);
-  score = 0;
-  bombMesh.visible = false;
-  liveGrenade.active = false;
-  grenadeMesh.visible = false;
-  hud.hideBanner();
-  hud.setScore(0, 0, 1);
-  refreshWallet();
-  upholdObjective();
-  match.startRound();
-  hud.showOverlay('start');
-}
-
-function syncCamera() {
-  camera.position.set(body.position.x, body.position.y + body.eye - body.landTimer, body.position.z);
-  camera.rotation.set(body.pitch, body.yaw, 0);
-  // The weapon's own sway rides on the camera, so the view model never lags the look.
-  camera.position.y -= body.crouching ? 0 : 0;
-  skyDome.position.copy(camera.position);
-}
-
-// ---- shooting --------------------------------------------------------------------------------
-function shootRay(spread, damage, pellets, range, headMultiplier, falloff) {
-  let hits = 0;
-  let killed = 0;
-  camera.getWorldDirection(direction);
-  for (let pellet = 0; pellet < pellets; pellet += 1) {
-    const dir = direction.clone();
-    if (spread > 0) {
-      dir.x += (random() * 2 - 1) * spread;
-      dir.y += (random() * 2 - 1) * spread;
-      dir.z += (random() * 2 - 1) * spread;
-      dir.normalize();
-    }
-    raycaster.set(camera.position, dir);
-    raycaster.far = range;
-    const hit = raycaster.intersectObjects(shootMeshes, false)[0];
-    if (!hit) continue;
-    const botIndex = bots.hitMeshes.indexOf(hit.object);
-    if (botIndex === -1) continue;
-    const bot = bots.items.find((entry) => entry.head === hit.object || entry.torso === hit.object
-      || entry.legL === hit.object || entry.legR === hit.object || entry.armL === hit.object || entry.armR === hit.object);
-    if (!bot || !bot.alive) continue;
-    const part = hit.object.userData.part ?? 'limb';
-    const scaled = part === 'head' ? damage * headMultiplier : damage;
-    const away = hit.distance / (falloff || 60);
-    const finalDamage = scaled * Math.max(0.35, 1 - away * 0.55);
-    const isKill = bots.damage(bot, finalDamage, part);
-    hits += 1;
-    if (isKill) {
-      killed += 1;
-      match.award(match.constants.KILL_REWARD);
-      hud.pushFeed(`<b>you</b> → ${part === 'head' ? 'HEADSHOT' : 'attacker'}`);
-      if (bots.aliveCount() === 0) {
-        match.endRound('ct', 'attackers eliminated');
+function decayEffects(dt) {
+  const attr = tracerGeometry.getAttribute('position');
+  let dirty = false;
+  for (let i = 0; i < TRACER_COUNT; i += 1) {
+    if (tracerLife[i] > 0) {
+      tracerLife[i] -= dt;
+      if (tracerLife[i] <= 0) {
+        const base = i * 6;
+        for (let k = 0; k < 6; k += 1) attr.array[base + k] = 0;
+        dirty = true;
       }
     }
   }
-  return { hits, killed };
+  if (dirty) attr.needsUpdate = true;
+  sparkMaterial.opacity = 0.9;
 }
 
-function fire() {
-  const spec = arsenal.spec();
-  if (!arsenal.ready()) return;
-  if (!arsenal.takeRound()) {
-    arsenal.reload();
-    return;
-  }
-  const spread = arsenal.spread(player.speed());
-  const result = shootRay(spread, spec.damage, spec.pellets, spec.range, spec.headMultiplier, spec.range);
-  arsenal.pullTrigger(player.speed());
-  player.recoil(spec.recoilPitch * (1 + random() * 0.3), (random() * 2 - 1) * spec.recoilYaw);
-  if (result.hits > 0) hud.hitMarker(result.killed > 0);
-  match.registerNoise(body.position.x, body.position.z);
-  if (match.state.phase === 'buy') {
-    match.state.phase = 'live';
-    match.state.buyOpen = false;
-    match.state.clock = match.constants.ROUND_SECONDS;
-    hud.hideBuy();
-    upholdObjective();
-  }
-  refreshWallet();
-}
+// ---- shooting ----
+function fireOnce() {
+  if (!player.alive) return;
+  const produced = carbine.fire();
+  if (!produced) return;
 
-function throwGrenade() {
-  if (!arsenal.useGrenade()) return;
-  liveGrenade.active = true;
-  liveGrenade.fuse = GRENADE.fuse;
-  camera.getWorldDirection(direction);
-  liveGrenade.position.set(camera.position.x, camera.position.y, camera.position.z);
-  liveGrenade.position.addScaledVector(direction, 0.5);
-  liveGrenade.velocity.copy(direction).multiplyScalar(17);
-  liveGrenade.velocity.y += 3.4;
-  grenadeMesh.visible = true;
-  grenadeMesh.position.copy(liveGrenade.position);
-  match.registerNoise(body.position.x, body.position.z);
-  refreshWallet();
-}
+  carbine.rig.updateWorldMatrix(true, false);
+  carbine.worldMuzzle();
+  carbine.rig.getWorldPosition(muzzlePoint);
 
-function stepGrenade(dt) {
-  if (!liveGrenade.active) return;
-  liveGrenade.fuse -= dt;
-  liveGrenade.velocity.y -= 19 * dt;
-  liveGrenade.position.addScaledVector(liveGrenade.velocity, dt);
-  if (liveGrenade.position.y < 0.12) {
-    liveGrenade.position.y = 0.12;
-    liveGrenade.velocity.set(liveGrenade.velocity.x * 0.55, -liveGrenade.velocity.y * 0.34, liveGrenade.velocity.z * 0.55);
-    if (Math.abs(liveGrenade.velocity.y) < 0.6) liveGrenade.velocity.y = 0;
-  }
-  grenadeMesh.position.copy(liveGrenade.position);
-  grenadeMesh.rotation.x += dt * 8;
-  grenadeMesh.rotation.y += dt * 5;
-  if (liveGrenade.fuse <= 0) {
-    liveGrenade.active = false;
-    grenadeMesh.visible = false;
-    blastAt.copy(liveGrenade.position);
-    blastTimer = 0.42;
-    blastMesh.visible = true;
-    blastMesh.position.copy(blastAt);
-    blastMesh.scale.setScalar(1);
-    blastMesh.material.opacity = 0.9;
-    match.registerNoise(blastAt.x, blastAt.z);
-    for (const bot of bots.items) {
-      if (!bot.alive) continue;
-      const distance = Math.hypot(bot.position.x - blastAt.x, bot.position.z - blastAt.z);
-      if (distance > GRENADE.radius) continue;
-      const falloff = 1 - distance / GRENADE.radius;
-      const killed = bots.damage(bot, GRENADE.damage * falloff, 'torso');
-      if (killed) {
-        match.award(match.constants.KILL_REWARD);
-        hud.pushFeed('<b>frag</b> → attacker');
+  forward.set(0, 0, -1).applyQuaternion(camera.quaternion);
+  // Spread: a small cone sample, wider while moving.
+  const moving = Math.hypot(body.state.velocity.x, body.state.velocity.z) > 1.2;
+  const cone = carbine.spec.spread * (moving ? 2.1 : 1);
+  forward.x += (random() - 0.5) * cone;
+  forward.y += (random() - 0.5) * cone;
+  forward.z += (random() - 0.5) * cone;
+  forward.normalize();
+
+  const origin = camera.getWorldPosition(eyePoint);
+  raycaster.set(origin, forward);
+  raycaster.far = 140;
+
+  const hits = raycaster.intersectObjects(shootables, false);
+  let end = origin.clone().add(forward.clone().multiplyScalar(90));
+
+  if (hits.length > 0) {
+    const hit = hits[0];
+    end = hit.point.clone();
+    const attacker = hit.object.userData.attacker;
+    if (attacker && attacker.alive) {
+      const head = hit.object.userData.zone === 'head';
+      const damage = carbine.spec.damage * (head ? carbine.spec.headMultiplier : 1);
+      const result = attackers.damage(attacker, damage, head);
+      readout.hitMarker();
+      if (result.killed) {
+        waves.addKill(head);
+        readout.dispatch(
+          head
+            ? '<b>you</b> → attacker <span>head shot</span>'
+            : '<b>you</b> → attacker <span>body</span>',
+        );
       }
-    }
-    if (bots.aliveCount() === 0 && match.state.phase === 'live') match.endRound('ct', 'attackers eliminated');
-    const selfDistance = Math.hypot(body.position.x - blastAt.x, body.position.z - blastAt.z);
-    if (selfDistance < GRENADE.radius) {
-      match.damagePlayer(Math.round(GRENADE.damage * 0.55 * (1 - selfDistance / GRENADE.radius)));
-      hud.flashDamage();
-    }
-  }
-}
-
-function stepBlast(dt) {
-  if (blastTimer <= 0) return;
-  blastTimer = Math.max(0, blastTimer - dt);
-  blastMesh.scale.setScalar(1 + (0.42 - blastTimer) * 9);
-  blastMesh.material.opacity = blastTimer * 1.6;
-  if (blastTimer === 0) blastMesh.visible = false;
-}
-
-// ---- the round -------------------------------------------------------------------------------
-function startRoundPlay() {
-  bots.spawnForRound(match.state.round);
-  player.health = 100;
-  player.reset(SPAWNS.ct);
-  arsenal.state.mag = arsenal.spec().magSize;
-  arsenal.state.reserve = arsenal.spec().reserve;
-  arsenal.state.grenades = Math.min(arsenal.state.grenades, GRENADE.max);
-  bombMesh.visible = false;
-  refreshWallet();
-  upholdObjective();
-}
-
-function handleEvents() {
-  for (const event of match.takeEvents()) {
-    if (event.type === 'roundStart') {
-      hud.hideBanner();
-      hud.showBanner(`ROUND ${event.round}`, 'Buy phase — press B', '');
-      setTimeout(() => hud.hideBanner(), 2400);
-    } else if (event.type === 'live') {
-      hud.hideBuy();
-      upholdObjective();
-      hud.showBanner('LIVE', 'Attackers moving', '');
-      setTimeout(() => hud.hideBanner(), 1400);
-    } else if (event.type === 'roundEnd') {
-      const won = event.winner === 'ct';
-      hud.showBanner(won ? 'ROUND WON' : 'ROUND LOST', `${event.reason} · $${Math.round(match.state.money)}`, won ? 'win' : 'lose');
-      hud.pushFeed(`<b>round</b> → ${event.winner.toUpperCase()} (${event.reason})`);
-      // The next round starts on a short delay, which is the only pause in the loop.
-      setTimeout(() => {
-        if (match.state.phase !== 'ended') return;
-        match.nextRound();
-        startRoundPlay();
-        hud.hideBanner();
-        hud.showBanner(`ROUND ${match.state.round}`, 'Buy phase — press B', '');
-        setTimeout(() => hud.hideBanner(), 2200);
-        hud.showBuy(match.state.money, arsenal.state.owned, match.state.armor >= 100, match.state.hasDefuseKit, arsenal.state.grenades);
-      }, 3200);
-    } else if (event.type === 'planted') {
-      hud.pushFeed('<b>attacker</b> → charge planted');
-      upholdObjective();
-    } else if (event.type === 'defused') {
-      hud.pushFeed('<b>you</b> → charge defused');
-    } else if (event.type === 'explode') {
-      hud.pushFeed('<b>charge</b> → detonated');
-      hud.flashDamage();
-    }
-  }
-}
-
-// ---- input actions ---------------------------------------------------------------------------
-function handleKeys() {
-  const pressed = input.takePressed();
-  const keys = input.state.keys;
-
-  if (pressed.has('KeyB')) {
-    if (hud.isBuyOpen()) hud.hideBuy();
-    else {
-      refreshBuy();
-      match.state.buyOpen = true;
-    }
-  }
-
-  if (hud.isBuyOpen()) {
-    for (const item of BUY_LIST) {
-      if (!pressed.has(`Digit${item.key}`)) continue;
-      const result = match.buy(item.id);
-      if (result.ok) refreshBuy();
-      else hud.pushFeed(`<b>cannot</b> buy ${item.id} (${result.why})`);
-    }
-  } else {
-    if (pressed.has('Digit1')) arsenal.equip('pistol');
-    if (pressed.has('Digit2')) arsenal.equip('smg');
-    if (pressed.has('Digit3')) arsenal.equip('rifle');
-    if (pressed.has('Digit4')) arsenal.equip('shotgun');
-    if (pressed.has('KeyG')) throwGrenade();
-  }
-
-  if (pressed.has('KeyR')) arsenal.reload();
-  if (pressed.has('KeyE') && match.state.phase === 'matchover') restartMatch();
-  void keys;
-}
-
-// ---- the fixed step --------------------------------------------------------------------------
-function step(dt) {
-  handleKeys();
-  player.step(dt, hud.isBuyOpen() ? new Set() : input.state.keys);
-  arsenal.step(dt, player.speed());
-  syncCamera();
-
-  // The muzzle point, used for the bomb and defuse checks.
-  camera.getWorldDirection(direction);
-  muzzle.copy(camera.position).addScaledVector(direction, 0.35);
-
-  const holdingE = input.state.keys.has('KeyE') && !hud.isBuyOpen();
-  const canPlant = false; // the defender never plants
-  void canPlant;
-
-  // Defusing: hold E on the planted charge.
-  if (match.state.bomb.planted) {
-    const distance = Math.hypot(body.position.x - (match.state.bomb.position?.x ?? SITE.center[0]), body.position.z - (match.state.bomb.position?.z ?? SITE.center[1]));
-    if (holdingE && distance < 2.0 && match.state.phase === 'live') {
-      match.tryDefuse(dt);
-      hud.showProgress('DEFUSING', 1 - match.state.bomb.defuseLeft / (match.state.hasDefuseKit ? match.constants.DEFUSE_KIT_SECONDS : match.constants.DEFUSE_SECONDS));
     } else {
-      match.stopDefuse();
-      hud.hideProgress();
+      sparkAt(hit.point);
     }
-  } else {
-    hud.hideProgress();
   }
 
-  // Bots: they see the player, shoot, plant, and walk their route. During the buy phase the doors
-  // are shut, so they advance their route but hold fire — taking damage while reading a menu is a
-  // bug, not tension.
-  const noise = match.state.phase === 'live' ? match.state.noise : 0;
-  const canEngage = player.health > 0 && match.state.phase === 'live';
-  bots.step(
+  // The tracer starts at the muzzle and ends where the round stopped.
+  pushTracer(carbine.worldMuzzle().clone(), end);
+  // A round fired close enough to the player's eye reads as a shake upward.
+  body.state.pitch += carbine.spec.recoil * 0.55;
+}
+
+function takePlayerDamage(amount, head) {
+  if (!player.alive) return;
+  let incoming = amount;
+  if (player.armour > 0) {
+    const absorbed = Math.min(player.armour, incoming * 0.6);
+    player.armour -= absorbed;
+    incoming -= absorbed;
+  }
+  player.health -= incoming;
+  player.hurtFlash = 1;
+  if (player.health <= 0) {
+    player.health = 0;
+    player.alive = false;
+    endRun();
+  }
+}
+
+function spawnOne() {
+  const gate = Math.floor(random() * yard.spawns.attackers.length);
+  const at = yard.spawns.attackers[gate];
+  const holding = pickHolding(gate * 2 + waves.run.wave);
+  // Nudge the spawn so two bodies never start inside each other.
+  attackers.spawn({
+    at: { x: at.x + (random() - 0.5) * 1.6, z: at.z + (random() - 0.5) * 1.6 },
+    holding,
+  });
+}
+
+function startRun() {
+  player.health = player.maxHealth;
+  player.armour = 50;
+  player.alive = true;
+  player.hurtFlash = 0;
+  body.state.position.set(yard.spawns.player.x, 0, yard.spawns.player.z);
+  body.state.velocity.set(0, 0, 0);
+  body.state.yaw = yard.spawns.player.yaw;
+  body.state.pitch = 0;
+  carbine.state.magazine = carbine.spec.magazine;
+  carbine.state.reserve = carbine.spec.reserve;
+  carbine.state.reloading = false;
+  for (const attacker of attackers.attackers.slice()) attackers.clearDead();
+  waves.begin();
+  readout.hideReport();
+  readout.showTitle(false);
+  readout.setScore(0);
+  readout.setWave(1, 0);
+  readout.gunLabel(carbine.spec.name);
+  started = true;
+  running = true;
+  paused = false;
+  input.request();
+  readout.callout('WAVE 1', 'hold the kiln floor', 2.2);
+}
+
+function endRun() {
+  running = false;
+  waves.end();
+  const report = {
+    waves: waves.run.wavesHeld,
+    score: waves.run.score,
+    kills: waves.run.kills,
+    heads: waves.run.heads,
+    line: runLine(),
+  };
+  readout.showReport(report);
+  input.release();
+}
+
+function runLine() {
+  const held = waves.run.wavesHeld;
+  if (held === 0) return 'They walked through the gates you were holding.';
+  if (held < 3) return `You held ${held} wave${held === 1 ? '' : 's'} before the yard gave way.`;
+  if (held < 6) return `${held} waves down and the kiln floor still yours — until it was not.`;
+  return `${held} waves. The gates never stopped coming.`;
+}
+
+// ---- one fixed step ----
+function stepWorld(dt) {
+  const pressed = input.takePressed();
+  const look = input.takeLook();
+
+  if (player.alive && running) {
+    body.look(look.x, look.y);
+    body.state.sprinting = input.state.keys.has('Space');
+
+    let wishX = 0;
+    let wishZ = 0;
+    if (input.state.keys.has('KeyW')) wishZ -= 1;
+    if (input.state.keys.has('KeyS')) wishZ += 1;
+    if (input.state.keys.has('KeyA')) wishX -= 1;
+    if (input.state.keys.has('KeyD')) wishX += 1;
+
+    // Move relative to where the player is looking, not the world axes.
+    const sin = Math.sin(body.state.yaw);
+    const cos = Math.cos(body.state.yaw);
+    const worldX = wishX * cos - wishZ * sin;
+    const worldZ = wishX * sin + wishZ * cos;
+
+    body.step(dt, worldX, worldZ, false);
+
+    if (pressed.includes('KeyR')) carbine.beginReload();
+    if (pressed.includes('Escape')) input.release();
+
+    if (input.state.firing) fireOnce();
+  } else {
+    input.takeLook();
+  }
+
+  carbine.step(
     dt,
-    new THREE.Vector3(body.position.x, body.position.y + 1.1, body.position.z),
-    canEngage,
-    noise,
-    onBotShoot,
-    onBotPlant,
+    Math.hypot(body.state.velocity.x, body.state.velocity.z) > 0.9,
+    body.state.sprinting,
   );
 
-  stepGrenade(dt);
-  stepBlast(dt);
+  const eye = body.eye(eyePoint);
 
-  // The bomb's own clock and the round's.
-  match.step(dt, { playerMovedAndReady: false });
-
-  // Firing, on the fixed step so the fire rate is the same at every frame rate.
-  if (input.state.firing && !hud.isBuyOpen() && match.state.phase !== 'ended' && match.state.phase !== 'matchover') {
-    const spec = arsenal.spec();
-    if (spec.auto) {
-      if (arsenal.ready()) fire();
-    } else if (!firingHeld) {
-      firingHeld = true;
-      fire();
+  // The attackers only act while the run is live: a body that arrives during the report is quiet.
+  if (running) {
+    attackers.step(dt, eye, takePlayerDamage);
+    const result = waves.step(dt, attackers.liveCount());
+    for (let i = 0; i < result.spawn; i += 1) spawnOne();
+    if (result.waveStarted > 0) {
+      readout.callout(`WAVE ${result.waveStarted}`, `${waves.run.quotaThisWave} coming`, 2.0);
     }
-  }
-  if (!input.state.firing) firingHeld = false;
-
-  if (match.state.bomb.planted) {
-    bombMesh.visible = true;
-    bombMesh.position.set(
-      match.state.bomb.position.x,
-      0.1 + Math.sin(performance.now() * 0.006) * 0.01,
-      match.state.bomb.position.z,
-    );
-    bombMesh.material.emissiveIntensity = 0.3 + Math.sin(performance.now() * 0.012) * 0.25;
-  }
-
-  handleEvents();
-
-  // Vitals and the wallet, pushed once per step rather than once per frame.
-  hud.setVitals(player.health, match.state.armor);
-  hud.setWallet(match.state.money);
-  hud.setWeapon(arsenal.spec().name, arsenal.state.mag, arsenal.state.reserve, arsenal.state.grenades, true);
-  hud.setClock(match.state.bomb.planted ? match.state.bomb.timer : match.state.clock, match.state.bomb.planted);
-  hud.setScore(match.state.scoreCT, match.state.scoreT, match.state.round);
-  const spreadPixels = arsenal.spread(player.speed()) * 1500;
-  hud.setSpread(spreadPixels);
-
-  if (match.state.phase === 'matchover') {
-    hud.showOverlay('matchover', `${match.state.scoreCT} — ${match.state.scoreT}`);
-    input.state.firing = false;
-  }
-}
-
-function onBotShoot(bot, aimAt, damage, distance) {
-  if (suppressBotFire) return false;
-  // A bot's shot is a ray against the player's body box: head, torso, or a miss.
-  muzzle.set(bot.position.x, 1.4, bot.position.z);
-  const toTarget = aimAt.clone().sub(muzzle);
-  const length = toTarget.length();
-  toTarget.normalize();
-  const playerCenter = new THREE.Vector3(body.position.x, body.position.y + (body.crouching ? 0.75 : 1.1), body.position.z);
-  const toPlayer = playerCenter.clone().sub(muzzle);
-  const along = toPlayer.dot(toTarget);
-  if (along < 0) return false;
-  const closest = muzzle.clone().addScaledVector(toTarget, along);
-  const miss = closest.distanceTo(playerCenter);
-  // The body is roughly a 0.5 m cylinder; a shot inside it lands, a head-height shot hits harder.
-  if (miss > 0.62) return false;
-  const headY = body.position.y + (body.crouching ? 1.02 : 1.62);
-  const isHead = Math.abs(closest.y - headY) < 0.24 && miss < 0.34;
-  const dealt = match.damagePlayer(isHead ? damage * 2.6 : damage);
-  hud.flashDamage();
-  hud.pushFeed(`<b>${bot.index === 0 ? 'carrier' : 'attacker'}</b> → you${isHead ? ' (head)' : ''}`);
-  if (player.health <= 0) {
-    hud.showBanner('DEFENDER DOWN', 'The attackers take the round', 'lose');
-  }
-  return true;
-}
-
-function onBotPlant(bot, dt) {
-  if (match.state.bomb.planted) return;
-  match.state.bomb.position = { x: bot.position.x, z: bot.position.z };
-  match.registerNoise(bot.position.x, bot.position.z);
-  match.plantProgress(dt);
-  if (match.state.bomb.planted) {
-    hud.pushFeed('<b>carrier</b> → charge armed');
-  }
-}
-
-// ---- the loop --------------------------------------------------------------------------------
-function frame(now) {
-  requestAnimationFrame(frame);
-  const dt = Math.min((now - lastTime) / 1000, 0.1);
-  lastTime = now;
-  if (!frozen) {
-    const look = input.takeLook();
-    player.look(look.x, look.y);
-    accumulator += dt;
-    let steps = 0;
-    while (accumulator >= FIXED_STEP && steps < 5) {
-      step(FIXED_STEP);
-      accumulator -= FIXED_STEP;
-      steps += 1;
+    if (result.waveCleared > 0) {
+      readout.callout('WAVE HELD', 'they are regrouping', 2.2);
+      readout.dispatch('<b>wave held</b> <span>+bonus</span>', 3.0);
     }
-    if (accumulator > FIXED_STEP * 5) accumulator = 0;
+    attackers.clearDead();
   }
-  renderer.render(scene, camera);
+
+  if (player.hurtFlash > 0) player.hurtFlash = Math.max(0, player.hurtFlash - dt * 2.4);
+
+  decayEffects(dt);
+  readout.tick(dt);
+  readout.setVitals(player.health, player.armour);
+  readout.setAmmo(carbine.state.magazine, carbine.state.maxMagazine, carbine.state.reloading);
+  readout.setScore(waves.run.score);
+  const remaining = Math.max(0, waves.run.quotaThisWave - waves.run.spawnedThisWave) + attackers.liveCount();
+  readout.setWave(Math.max(1, waves.run.wave), remaining);
 }
 
-// ---- deterministic shot frames ---------------------------------------------------------------
-function settle(steps) {
-  for (let index = 0; index < steps; index += 1) step(FIXED_STEP);
+// ---- the camera follows the body ----
+const camTarget = new THREE.Vector3();
+const camQuat = new THREE.Quaternion();
+const camEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+
+function syncCamera() {
+  body.eye(camTarget);
+  // A small bob while walking, and a lean into the strafe, so the body reads as having weight.
+  const speed = Math.hypot(body.state.velocity.x, body.state.velocity.z);
+  const bob = speed > 0.9 ? Math.sin(performance.now() * 0.0105) * 0.019 : 0;
+  camTarget.y += bob;
+  camera.position.copy(camTarget);
+  camEuler.set(body.state.pitch, body.state.yaw, 0);
+  camQuat.setFromEuler(camEuler);
+  camera.quaternion.copy(camQuat);
 }
 
-function aimAtPoint(point) {
-  const dx = point.x - camera.position.x;
-  const dy = point.y - camera.position.y;
-  const dz = point.z - camera.position.z;
-  const length = Math.hypot(dx, dy, dz) || 1;
-  body.yaw = Math.atan2(-dx, -dz);
-  body.pitch = Math.asin(Math.max(-1, Math.min(1, dy / length)));
-  syncCamera();
+// ---- capture frames ----
+// Each one lays out the world as if the player had been at it for a while: the point is to show
+// the loop, not to be playable.
+function placeAttacker(at, holding, offset = 0) {
+  const attacker = attackers.spawn({ at, holding });
+  if (offset > 0) {
+    attacker.waypoint = offset;
+    attacker.root.position.set(at.x, 0, at.z);
+  }
+  return attacker;
 }
 
-function runShot(name) {
-  hud.hideAllPanels();
-  hud.hideBanner();
-  hud.clearFeed();
-  match.startRound();
-  // The capture harness must not be shot at: the frames show the defender holding a lane, not
-  // the defender dying in a cutscene.
-  suppressBotFire = true;
-  bots.spawnForRound(1);
-  hud.setScore(0, 0, 1);
-  hud.setWallet(match.state.money);
+function runShot(which) {
+  readout.showTitle(false);
+  waves.begin();
+  readout.gunLabel(carbine.spec.name);
+  readout.setScore(0);
+  readout.setWave(1, 0);
 
-  if (name === 'play' || name === 'end') {
-    body.position.set(-9.5, 0, 1.5);
-    body.yaw = Math.PI * 0.86;
-    body.pitch = -0.02;
-    arsenal.buy('rifle');
-    arsenal.state.mag = 24;
-    arsenal.state.grenades = 1;
-    match.state.armor = 100;
-    match.state.money = 3450;
-    match.state.phase = 'live';
-    match.state.godMode = true;
-    settle(6);
-    // Walk the bots into the yard so the frames show a real engagement rather than a spawn,
-    // then stagger them: four attackers on one line reads as wallpaper, four at four depths
-    // reads as a yard with people in it.
-    settle(200);
-    const staging = [
-      [-13.6, -4.4, 2.7],
-      [-8.9, -7.8, 3.0],
-      [-3.2, -3.1, 2.4],
-      [-0.6, -9.2, 2.85],
-    ];
-    bots.items.forEach((bot, index) => {
-      const [x, z, yaw] = staging[index % staging.length];
-      bot.position.set(x, 0, z);
-      bot.yaw = yaw;
-      bot.targetYaw = yaw;
-      bot.group.position.set(x, 0, z);
-      bot.group.rotation.y = yaw;
-      bot.state = 'hold';
-      bot.holdTimer = 3;
+  if (which === 'start') {
+    // The title screen over the yard: the sheet carries the pitch, the frame carries the place.
+    readout.showTitle(true);
+    body.state.position.set(2.5, 0, -2.0);
+    body.state.yaw = Math.PI * 0.94;
+    body.state.pitch = -0.05;
+    camTarget.set(body.state.position.x, BODY.eye, body.state.position.z);
+    camera.position.copy(camTarget);
+    camEuler.set(body.state.pitch, body.state.yaw, 0);
+    camera.quaternion.setFromEuler(camEuler);
+    renderer.render(scene, camera);
+    window.__shotReady = true;
+    return;
+  }
+
+  if (which === 'play') {
+    // Mid-fight: the player is pushing the kiln approach with three attackers closing. The camera
+    // is close enough that a body fills a fair share of the frame, because a capture of a shooter
+    // has to show what the gun is pointed at.
+    body.state.position.set(-1.0, 0, -10.4);
+    // Aimed at the centre attacker's chest, not at the wall: the crosshair and the tracer have to
+    // agree with what the frame is about. Chest sits ~0.35 m below the eye over a 7.8 m gap, so
+    // the pitch is a hair negative.
+    body.state.yaw = Math.PI + 0.239;
+    body.state.pitch = -0.048;
+    player.health = 76;
+    player.armour = 28;
+
+    const closeOne = placeAttacker({ x: -4.2, z: -3.0 }, { node: 7, look: [0, -10] });
+    const closeTwo = placeAttacker({ x: 0.9, z: -2.6 }, { node: 4, look: [0, -4] });
+    const closeThree = placeAttacker({ x: 6.0, z: -4.4 }, { node: 6, look: [9.5, -6] });
+    for (const attacker of [closeOne, closeTwo, closeThree]) {
+      attacker.root.rotation.y = Math.PI;
+      attacker.noticed = true;
+      // Mid-stride: legs apart reads as motion even in a still.
+      attacker.parts.leftLeg.rotation.x = 0.42;
+      attacker.parts.rightLeg.rotation.x = -0.34;
+      attacker.parts.leftArm.rotation.x = -0.26;
+      attacker.parts.rightArm.rotation.x = 0.3;
+    }
+
+    // A burst in the air: a tracer from the muzzle into the middle attacker, a spark where the
+    // round lands, and the muzzle flash lit. Set here because a capture renders one frame and the
+    // live effect pools would already have decayed.
+    carbine.state.magazine = 19;
+    carbine.rig.updateWorldMatrix(true, false);
+    const muzzleAt = carbine.worldMuzzle().clone();
+    const impactAt = new THREE.Vector3(0.9, 1.34, -2.6);
+    pushTracer(muzzleAt, impactAt);
+    tracerLife[0] = 999;
+    sparkAt(impactAt);
+    carbine.rig.traverse((child) => {
+      if (child.isPointLight) child.intensity = 11;
     });
-    settle(12);
-    const target = bots.items.find((bot) => bot.alive) ?? bots.items[0];
-    aimAtPoint(new THREE.Vector3(target.position.x, target.position.y + 1.3, target.position.z));
-    for (let burst = 0; burst < 3; burst += 1) {
-      fire();
-      settle(4);
-    }
-    if (name === 'end') {
-      // Down the rest of them: the end frame is the round won, feed full, score moved.
-      for (const bot of bots.items) {
-        if (!bot.alive) continue;
-        aimAtPoint(new THREE.Vector3(bot.position.x, bot.position.y + 1.35, bot.position.z));
-        for (let shot = 0; shot < 4; shot += 1) {
-          arsenal.state.mag = 30;
-          fire();
-          settle(3);
-        }
-      }
-      // The round is over: the clock stops, the score moves, the objective clears. The plant is
-      // shown as evidence the attackers got the charge down before they were cleared.
-      match.state.phase = 'ended';
-      match.state.scoreCT = 1;
-      match.state.scoreT = 0;
-      match.state.bomb.planted = true;
-      match.state.bomb.position = { x: -12.4, z: -3.6 };
-      match.state.bomb.timer = 0;
-      match.state.money = 6100;
-      match.state.armor = 100;
-      player.health = 68;
-      body.position.set(-10.6, 0, 0.4);
-      aimAtPoint(new THREE.Vector3(-12.4, 0.2, -3.6));
-      hud.showBanner('ROUND WON', 'Attackers eliminated', 'win');
-      hud.setObjective('Round won. Press E to deploy into the next one.', false);
-      hud.setScore(1, 0, 1);
-      hud.setClock(0, false);
-      hud.setWallet(6100);
-      hud.pushFeed('<b>you</b> → attacker <span>headshot</span>');
-      hud.pushFeed('<b>you</b> → attacker');
-      hud.pushFeed('<b>you</b> → attacker');
-      hud.pushFeed('<b>carrier</b> → charge down');
-      settle(2);
-    } else {
-      player.health = 84;
-      hud.hideBanner();
-      hud.pushFeed('<b>you</b> → attacker <span>headshot</span>');
-      hud.pushFeed('<b>you</b> → attacker');
-      settle(2);
-    }
-    refreshWallet();
-    hud.setClock(match.state.bomb.planted ? match.state.bomb.timer : 62, match.state.bomb.planted);
-    hud.setObjective(match.state.bomb.planted ? 'CHARGE PLANTED — hold E on the kiln floor to defuse.' : 'Stop the attackers reaching the kiln floor. Headshots end fights.', match.state.bomb.planted);
-    hud.setSpread(2);
-  } else if (name === 'buy') {
-    body.position.set(-1.0, 0, -16.5);
-    body.yaw = Math.PI * 1.02;
-    body.pitch = -0.03;
-    match.state.phase = 'buy';
-    match.state.money = 4150;
-    match.state.armor = 100;
-    arsenal.buy('rifle');
-    refreshBuy();
-    settle(4);
-    hud.setObjective('Buy phase. Spend before the doors open.', false);
-    hud.setScore(0, 0, 3);
-    hud.setClock(105, false);
-    hud.setWallet(4150);
-    hud.setVitals(100, 100);
-    hud.hideBanner();
-  } else {
-    // start: the defender's spawn pocket looking down the west lane at the lit kiln.
-    body.position.set(0, 0, -16.2);
-    body.yaw = Math.PI * 1.16;
-    body.pitch = -0.12;
-    match.state.phase = 'live';
-    match.state.money = 800;
-    settle(3);
-    hud.showOverlay('start');
-  }
 
-  paintTwiceThenReady();
-}
+    readout.setVitals(player.health, player.armour);
+    readout.setAmmo(19, 30, false);
+    readout.setScore(640);
+    readout.setWave(3, 3);
+    readout.hitMarker();
+    readout.dispatch('<b>you</b> → attacker <span>head shot</span>', 60);
+    readout.dispatch('<b>you</b> → attacker <span>body</span>', 60);
+    readout.dispatch('<b>wave held</b> <span>+bonus</span>', 60);
 
-function paintTwiceThenReady() {
-  let painted = 0;
-  function paint() {
-    requestAnimationFrame(paint);
     syncCamera();
     renderer.render(scene, camera);
-    painted += 1;
-    if (painted === 2) {
-      window.__shotReady = true;
-      frozen = true;
-    }
+    window.__shotReady = true;
+    return;
   }
-  requestAnimationFrame(paint);
+
+  if (which === 'end') {
+    // The after-action report, with a real run behind it.
+    player.health = 0;
+    player.alive = false;
+    running = false;
+    waves.run.wave = 4;
+    waves.run.wavesHeld = 3;
+    waves.run.score = 1840;
+    waves.run.kills = 21;
+    waves.run.heads = 9;
+    body.state.position.set(-1.0, 0, -4.0);
+    body.state.yaw = Math.PI;
+    body.state.pitch = -0.02;
+    placeAttacker({ x: 1.2, z: 5.0 }, { node: 4, look: [0, -6] });
+    placeAttacker({ x: 5.0, z: 1.0 }, { node: 6, look: [9.5, -6] });
+    syncCamera();
+    readout.showReport({
+      waves: 3, score: 1840, kills: 21, heads: 9,
+      line: 'You held 3 waves before the yard gave way.',
+    });
+    renderer.render(scene, camera);
+    window.__shotReady = true;
+    return;
+  }
+
+  // Anything else is a title frame.
+  readout.showTitle(true);
+  renderer.render(scene, camera);
+  window.__shotReady = true;
+}
+
+// ---- the loop ----
+function frame(now) {
+  const raw = (now - clock.last) / 1000;
+  clock.last = now;
+  // A tab that was backgrounded returns one huge delta; clamp it so nothing tunnels.
+  const dt = Math.min(raw, 0.1);
+
+  if (running) {
+    clock.accumulator += dt;
+    let guard = 0;
+    while (clock.accumulator >= FIXED_STEP && guard < 8) {
+      stepWorld(FIXED_STEP);
+      clock.accumulator -= FIXED_STEP;
+      guard += 1;
+    }
+    if (guard >= 8) clock.accumulator = 0;
+  } else if (started) {
+    // The report is up: keep the readout alive for the fade, but stop the world.
+    readout.tick(dt);
+  }
+
+  syncCamera();
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
 }
 
 window.addEventListener('resize', () => {
@@ -713,17 +537,19 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// Pointer lock is the input path; the escape key releases it and pauses.
-document.addEventListener('keydown', (event) => {
-  if (event.code === 'Escape' && hud.isBuyOpen()) hud.hideBuy();
-});
+readout.onBegin(startRun);
+readout.onAgain(startRun);
 
-syncCamera();
-for (const key of Object.keys(WEAPONS)) arsenal.models[key].visible = key === 'pistol';
-if (shot) runShot(shot);
-else {
-  match.startRound();
-  bots.spawnForRound(1);
-  hud.showOverlay('start');
+if (shot) {
+  runShot(shot);
+} else {
+  // The idle attract frame behind the title sheet: the yard, lit, with the title over it.
+  body.state.position.set(2.5, 0, -2.0);
+  body.state.yaw = Math.PI * 0.94;
+  body.state.pitch = -0.05;
+  readout.showTitle(true);
+  syncCamera();
+  renderer.render(scene, camera);
+  clock.last = performance.now();
   requestAnimationFrame(frame);
 }

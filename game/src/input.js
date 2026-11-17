@@ -1,66 +1,81 @@
-// Keyboard and mouse, and the pointer lock that turns the mouse into look. Plain browser
-// APIs only: the game asks the canvas for pointer lock and reads movementX/Y while it holds it.
-//
-// Two different questions get asked of the keyboard: "is this held down" (movement) and "was
-// this tapped" (buy keys, reload, weapon switch). A browser fires keydown and keyup possibly
-// inside the same frame, so a held-key Set alone silently swallows quick taps. Every keydown is
-// therefore also queued, and the simulation drains that queue once per fixed step.
+// Keyboard and pointer lock, edge-triggered. Two things matter here and both are easy to get
+// wrong: a tap that starts and ends between two frames must still register, and the mouse only
+// turns the view while the canvas actually holds the pointer.
+
 export function createInput(canvas, onLockChange) {
   const keys = new Set();
-  const queued = new Set();
-  const state = { keys, locked: false, firing: false, lookX: 0, lookY: 0 };
+  const queued = [];          // taps seen since the last frame, in order
+  const state = {
+    keys,
+    lookX: 0,
+    lookY: 0,
+    firing: false,
+    locked: false,
+  };
 
-  function setKey(event, down) {
-    if (down) {
-      if (!keys.has(event.code)) queued.add(event.code);
-      keys.add(event.code);
-    } else {
-      keys.delete(event.code);
-    }
-    if (event.code === 'Space') event.preventDefault();
+  function down(event) {
+    // The browser's own shortcuts would otherwise eat Tab and the arrows.
+    if (event.code === 'Tab' || event.code.startsWith('Arrow')) event.preventDefault();
+    if (event.repeat) return;
+    if (!keys.has(event.code)) queued.push(event.code);
+    keys.add(event.code);
   }
 
-  window.addEventListener('keydown', (event) => setKey(event, true));
-  window.addEventListener('keyup', (event) => setKey(event, false));
-  window.addEventListener('blur', () => { keys.clear(); queued.clear(); });
+  function up(event) {
+    keys.delete(event.code);
+  }
+
+  window.addEventListener('keydown', down);
+  window.addEventListener('keyup', up);
+  // A window that loses focus never sends the keyup, so a held key would stay held forever.
+  window.addEventListener('blur', () => keys.clear());
+
+  canvas.addEventListener('mousedown', (event) => {
+    if (event.button === 0) state.firing = true;
+  });
+  window.addEventListener('mouseup', (event) => {
+    if (event.button === 0) state.firing = false;
+  });
+  canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+
   window.addEventListener('mousemove', (event) => {
     if (!state.locked) return;
     state.lookX += event.movementX;
     state.lookY += event.movementY;
   });
-  window.addEventListener('mousedown', (event) => {
-    if (state.locked && event.button === 0) state.firing = true;
-  });
-  window.addEventListener('mouseup', (event) => {
-    if (event.button === 0) state.firing = false;
-  });
+
   document.addEventListener('pointerlockchange', () => {
     state.locked = document.pointerLockElement === canvas;
     if (!state.locked) {
-      keys.clear();
-      queued.clear();
       state.firing = false;
+      keys.clear();
     }
-    onLockChange(state.locked);
+    if (onLockChange) onLockChange(state.locked);
   });
 
   return {
     state,
-    requestLock() {
-      canvas.requestPointerLock();
+    // Every key pressed since the last call, then the queue is cleared: a tap cannot be missed.
+    takePressed() {
+      const out = queued.slice();
+      queued.length = 0;
+      return out;
     },
+    // Mouse delta since the last call, in pixels, then zeroed.
     takeLook() {
-      const x = state.lookX;
-      const y = state.lookY;
+      const out = { x: state.lookX, y: state.lookY };
       state.lookX = 0;
       state.lookY = 0;
-      return { x, y };
+      return out;
     },
-    // Everything tapped since the last call. Cleared on read so one press is one action.
-    takePressed() {
-      const pressed = new Set(queued);
-      queued.clear();
-      return pressed;
+    request() {
+      const asked = canvas.requestPointerLock();
+      // Chrome returns a promise here and rejects it when the gesture was not trusted; the
+      // rejection is expected during a capture run and says nothing useful.
+      if (asked && typeof asked.catch === 'function') asked.catch(() => {});
+    },
+    release() {
+      if (document.pointerLockElement === canvas) document.exitPointerLock();
     },
   };
 }
